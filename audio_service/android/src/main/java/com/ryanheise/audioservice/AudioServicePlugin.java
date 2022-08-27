@@ -73,6 +73,7 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
     }
     public static synchronized FlutterEngine getFlutterEngine(Context context) {
         if (armStartup == false) {
+            System.out.println("armStartup ",armStartup);
             return null;
         }
         FlutterEngine flutterEngine = FlutterEngineCache.getInstance().get(flutterEngineId);
