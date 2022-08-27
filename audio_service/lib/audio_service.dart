@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:isolate';
 import 'dart:ui';
 
@@ -579,8 +580,31 @@ class MediaItem {
   /// The duration of this media item.
   final Duration? duration;
 
-  /// The artwork for this media item as a uri.
+  /// The artwork URI for this media item.
+  ///
+  /// Supported types of URIs are:
+  ///
+  ///  * File - file://
+  ///  * Network - http:// https:// etc.
+  ///  * Android content URIs - content://
+  ///
+  /// ## Speeding up Android content URI loading
+  ///
+  /// For Android content:// URIs, the plugin by default uses
+  /// `ContentResolver.openFileDescriptor`, which takes the direct URI of an
+  /// image.
+  ///
+  /// On Android API >= 29 there is `ContentResolver.loadThumbnail` function
+  /// which takes a URI of some content (for example, a song from `MediaStore`),
+  /// and returns a thumbnail for it.
+  ///
+  /// It is noticeably faster to use this function. You can enable this by
+  /// putting a `loadThumbnailUri` key into the [extras]. If `loadThumbnail` is
+  /// not available, it will just fallback to using `openFileDescriptor`.
   final Uri? artUri;
+
+  /// The HTTP headers to use when sending an HTTP request for [artUri].
+  final Map<String, String>? artHeaders;
 
   /// Whether this is playable (i.e. not a folder).
   final bool? playable;
@@ -613,6 +637,7 @@ class MediaItem {
     this.genre,
     this.duration,
     this.artUri,
+    this.artHeaders,
     this.playable = true,
     this.displayTitle,
     this.displaySubtitle,
@@ -877,10 +902,10 @@ class AudioService {
   static final _compatibilitySwitcher = SwitchAudioHandler();
 
   /// Register the app's [AudioHandler] with configuration options. This must be
-  /// called during the app's initialisation so that it is prepared to handle
-  /// audio requests immediately after a cold restart (e.g. if the user clicks
-  /// on the play button in the media notification while your app is not running
-  /// and your app needs to be woken up).
+  /// called once during the app's initialisation so that it is prepared to
+  /// handle audio requests immediately after a cold restart (e.g. if the user
+  /// clicks on the play button in the media notification while your app is not
+  /// running and your app needs to be woken up).
   ///
   /// You may optionally specify a [cacheManager] to use when loading artwork to
   /// display in the media notification and lock screen. This defaults to
@@ -920,7 +945,10 @@ class AudioService {
     await for (var mediaItem in _handler.mediaItem) {
       if (mediaItem == null) continue;
       final artUri = mediaItem.artUri;
-      if (artUri != null) {
+      if (artUri == null || artUri.scheme == 'content') {
+        await _platform.setMediaItem(
+            SetMediaItemRequest(mediaItem: mediaItem._toMessage()));
+      } else {
         // We potentially need to fetch the art.
         String? filePath;
         if (artUri.scheme == 'file') {
@@ -938,6 +966,7 @@ class AudioService {
             filePath = await _loadArtwork(mediaItem);
             // If we failed to download the art, abort.
             if (filePath == null) continue;
+            if (File(filePath).lengthSync() == 0) continue;
             // If we've already set a new media item, cancel this request.
             // XXX: Test this
             //if (mediaItem != _handler.mediaItem.value) continue;
@@ -950,9 +979,6 @@ class AudioService {
         // Show the media item after the art is loaded.
         await _platform.setMediaItem(
             SetMediaItemRequest(mediaItem: platformMediaItem._toMessage()));
-      } else {
-        await _platform.setMediaItem(
-            SetMediaItemRequest(mediaItem: mediaItem._toMessage()));
       }
     }
   }
@@ -1095,13 +1121,18 @@ class AudioService {
         if (artUri.scheme == 'file') {
           return artUri.toFilePath();
         } else {
-          final file =
-              await cacheManager.getSingleFile(mediaItem.artUri!.toString());
+          final headers = mediaItem.artHeaders;
+          final file = headers != null
+              ? await cacheManager.getSingleFile(mediaItem.artUri!.toString(),
+                  headers: headers)
+              : await cacheManager.getSingleFile(mediaItem.artUri!.toString());
           return file.path;
         }
       }
-    } catch (e) {
+    } catch (e, st) {
       // TODO: handle this somehow?
+      // ignore: avoid_print
+      print('Error loading artUri: $e\n$st');
     }
     return null;
   }

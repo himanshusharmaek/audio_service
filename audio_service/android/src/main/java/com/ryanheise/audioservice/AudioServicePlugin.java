@@ -58,6 +58,7 @@ import android.util.Log;
  */
 public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
     private static String flutterEngineId = "audio_service_engine";
+     private static boolean armStartup = false;
     /** Must be called BEFORE any FlutterEngine is created. e.g. in Application class. */
     public static void setFlutterEngineId(String id) {
         flutterEngineId = id;
@@ -65,7 +66,15 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
     public static String getFlutterEngineId() {
         return flutterEngineId;
     }
+
+    
+    public static synchronized void setArmStartup(boolean enabled) {
+        armStartup = enabled;
+    }
     public static synchronized FlutterEngine getFlutterEngine(Context context) {
+        if (armStartup == false) {
+            return null;
+        }
         FlutterEngine flutterEngine = FlutterEngineCache.getInstance().get(flutterEngineId);
         if (flutterEngine == null) {
             // XXX: The constructor triggers onAttachedToEngine so this variable doesn't help us.
@@ -97,7 +106,15 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
         return flutterEngine;
     }
 
-    public static void disposeFlutterEngine() {
+    public static synchronized void disposeFlutterEngine() {
+        for (ClientInterface clientInterface : clientInterfaces) {
+            if (clientInterface.activity != null) {
+                // Don't destroy the engine if a new activity started and
+                // bound to the service in the time since the previous activity
+                // unbound from it.
+                return;
+            }
+        }
         FlutterEngine flutterEngine = FlutterEngineCache.getInstance().get(flutterEngineId);
         if (flutterEngine != null) {
             flutterEngine.destroy();
@@ -108,7 +125,6 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
     private static final String CHANNEL_CLIENT = "com.ryanheise.audio_service.client.methods";
     private static final String CHANNEL_HANDLER = "com.ryanheise.audio_service.handler.methods";
 
-    private static Context applicationContext;
     private static final Set<ClientInterface> clientInterfaces = new HashSet<>();
     private static ClientInterface mainClientInterface;
     private static AudioHandlerInterface audioHandlerInterface;
@@ -181,6 +197,7 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
     // INSTANCE FIELDS AND METHODS
     //
 
+    private Context applicationContext;
     private FlutterPluginBinding flutterPluginBinding;
     private ActivityPluginBinding activityPluginBinding;
     private NewIntentListener newIntentListener;
@@ -260,13 +277,15 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
         }
         clientInterfaces.remove(clientInterface);
         clientInterface.setContext(null);
-        flutterPluginBinding = null;
         clientInterface = null;
         applicationContext = null;
-        if (audioHandlerInterface != null) {
+        if (audioHandlerInterface != null
+                && audioHandlerInterface.messenger == flutterPluginBinding.getBinaryMessenger()) {
+            System.out.println("### destroying audio handler interface");
             audioHandlerInterface.destroy();
             audioHandlerInterface = null;
         }
+        flutterPluginBinding = null;
     }
 
     //
@@ -533,8 +552,7 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
                         @SuppressWarnings("unchecked") List<Map<?, ?>> rawMediaItems = (List<Map<?, ?>>)response.get("children");
                         List<MediaBrowserCompat.MediaItem> mediaItems = new ArrayList<>();
                         for (Map<?, ?> rawMediaItem : rawMediaItems) {
-                            MediaMetadataCompat mediaMetadata = createMediaMetadata(rawMediaItem);
-                            mediaItems.add(new MediaBrowserCompat.MediaItem(mediaMetadata.getDescription(), (Boolean)rawMediaItem.get("playable") ? MediaBrowserCompat.MediaItem.FLAG_PLAYABLE : MediaBrowserCompat.MediaItem.FLAG_BROWSABLE));
+                            mediaItems.add(rawToMediaItem(rawMediaItem));
                         }
                         result.sendResult(mediaItems);
                     }
@@ -565,8 +583,7 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
                         Map<?, ?> response = (Map<?, ?>)obj;
                         Map<?, ?> rawMediaItem = (Map<?, ?>)response.get("mediaItem");
                         if (rawMediaItem != null) {
-                            MediaMetadataCompat mediaMetadata = createMediaMetadata(rawMediaItem);
-                            MediaBrowserCompat.MediaItem mediaItem = new MediaBrowserCompat.MediaItem(mediaMetadata.getDescription(), (Boolean)rawMediaItem.get("playable") ? MediaBrowserCompat.MediaItem.FLAG_PLAYABLE : MediaBrowserCompat.MediaItem.FLAG_BROWSABLE);
+                            MediaBrowserCompat.MediaItem mediaItem = rawToMediaItem(rawMediaItem);
                             result.sendResult(mediaItem);
                         } else {
                             result.sendResult(null);
@@ -600,8 +617,7 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
                         @SuppressWarnings("unchecked") List<Map<?, ?>> rawMediaItems = (List<Map<?, ?>>)response.get("mediaItems");
                         List<MediaBrowserCompat.MediaItem> mediaItems = new ArrayList<>();
                         for (Map<?, ?> rawMediaItem : rawMediaItems) {
-                            MediaMetadataCompat mediaMetadata = createMediaMetadata(rawMediaItem);
-                            mediaItems.add(new MediaBrowserCompat.MediaItem(mediaMetadata.getDescription(), (Boolean)rawMediaItem.get("playable") ? MediaBrowserCompat.MediaItem.FLAG_PLAYABLE : MediaBrowserCompat.MediaItem.FLAG_BROWSABLE));
+                            mediaItems.add(rawToMediaItem(rawMediaItem));
                         }
                         result.sendResult(mediaItems);
                     }
@@ -1105,12 +1121,48 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
         );
     }
 
+    /**
+     * Propagate mediaItem extras passed from dart to the description. By default, when creating
+     * a MediaMetadataCompat object, it doesn't propagate all the extras to the MediaDescription
+     * instance it holds.
+     *
+     * @param description original description object
+     * @param extras extras map coming from dart
+     * @return description with added extras
+     */
+    private static MediaDescriptionCompat addExtrasToMediaDescription(MediaDescriptionCompat description, Map<?, ?> extras) {
+        if (extras == null || extras.isEmpty()) {
+            return description;
+        }
+        final Bundle extrasBundle = new Bundle();
+        if (description.getExtras() != null) {
+            extrasBundle.putAll(description.getExtras());
+        }
+        extrasBundle.putAll(mapToBundle(extras));
+        return new MediaDescriptionCompat.Builder()
+                .setTitle(description.getTitle())
+                .setSubtitle(description.getSubtitle())
+                .setDescription(description.getDescription())
+                .setIconBitmap(description.getIconBitmap())
+                .setIconUri(description.getIconUri())
+                .setMediaId(description.getMediaId())
+                .setMediaUri(description.getMediaUri())
+                .setExtras(extrasBundle).build();
+    }
+
+    private static MediaBrowserCompat.MediaItem rawToMediaItem(Map<?, ?> rawMediaItem) {
+        MediaMetadataCompat mediaMetadata = createMediaMetadata(rawMediaItem);
+        final MediaDescriptionCompat description = addExtrasToMediaDescription(mediaMetadata.getDescription(), (Map<?, ?>)rawMediaItem.get("extras"));
+        final Boolean playable = (Boolean)rawMediaItem.get("playable");
+        return new MediaBrowserCompat.MediaItem(description, playable ? MediaBrowserCompat.MediaItem.FLAG_PLAYABLE : MediaBrowserCompat.MediaItem.FLAG_BROWSABLE);
+    }
+
     private static List<MediaSessionCompat.QueueItem> raw2queue(List<Map<?, ?>> rawQueue) {
         List<MediaSessionCompat.QueueItem> queue = new ArrayList<>();
         int i = 0;
         for (Map<?, ?> rawMediaItem : rawQueue) {
             MediaMetadataCompat mediaMetadata = createMediaMetadata(rawMediaItem);
-            MediaDescriptionCompat description = mediaMetadata.getDescription();
+            MediaDescriptionCompat description = addExtrasToMediaDescription(mediaMetadata.getDescription(), (Map<?, ?>)rawMediaItem.get("extras"));
             queue.add(new MediaSessionCompat.QueueItem(description, i));
             i++;
         }
@@ -1129,13 +1181,10 @@ public class AudioServicePlugin implements FlutterPlugin, ActivityAware {
         if (bundle == null) return null;
         Map<String, Object> map = new HashMap<>();
         for (String key : bundle.keySet()) {
-            Object value = bundle.get(key);
-            if (value instanceof Integer
-                    || value instanceof Long
-                    || value instanceof Double
-                    || value instanceof Float
-                    || value instanceof Boolean
-                    || value instanceof String) {
+            // TODO: use typesafe version once SDK 33 is released.
+            @SuppressWarnings("deprecation")
+            Object value = bundle.getSerializable(key);
+            if (value != null) {
                 map.put(key, value);
             }
         }
